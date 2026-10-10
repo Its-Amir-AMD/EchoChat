@@ -1,0 +1,7 @@
+{
+  "name": "EchoChat - Next-Gen Messaging Platform",
+  "description": "Modern, secure, intelligent messaging ecosystem featuring real-time private chats, groups, channels, voice/video calling, AI assistance, stories, polls, and full Persian (RTL) / English localization.",
+  "requestFramePermissions": ["CAMERA", "MICROPHONE"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
