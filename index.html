@@ -12,6 +12,26 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Vazirmatn:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script>
+      // Per AI Studio runtime constraints: HMR is disabled, ignore Vite HMR WebSocket errors
+      window.addEventListener('unhandledrejection', function(event) {
+        if (event && event.reason && (
+          String(event.reason.message || '').includes('WebSocket closed without opened') ||
+          String(event.reason.stack || '').includes('createWebSocketModuleRunnerTransport') ||
+          String(event.reason.message || '').includes('vite:ws')
+        )) {
+          event.preventDefault();
+        }
+      });
+      window.addEventListener('error', function(event) {
+        if (event && (
+          String(event.message || '').includes('WebSocket closed without opened') ||
+          String(event.filename || '').includes('@vite/client')
+        )) {
+          event.preventDefault();
+        }
+      });
+    </script>
   </head>
   <body class="bg-slate-900 text-slate-100 font-sans antialiased selection:bg-cyan-500/30 selection:text-cyan-200">
     <div id="root"></div>

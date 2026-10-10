@@ -22,6 +22,7 @@ import {
 } from '../data/initialData';
 import { soundEffects } from '../services/soundEffects';
 import { requestAiAssist } from '../services/geminiService';
+import { socketService } from '../services/socketService';
 
 interface ChatContextType {
   currentUser: User;
@@ -85,6 +86,7 @@ interface ChatContextType {
   drafts: Record<string, string>;
   setDraft: (conversationId: string, text: string) => void;
   typingUsers: string[];
+  isServerConnected: boolean;
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
@@ -92,7 +94,6 @@ const ChatContext = createContext<ChatContextType | undefined>(undefined);
 const STORAGE_KEY_PREFIX = 'echochat_v2_';
 
 export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  // Load initial states from localStorage with fallbacks
   const [currentUser, setCurrentUser] = useState<User>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}user`);
     return saved ? JSON.parse(saved) : CURRENT_USER;
@@ -119,6 +120,7 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [searchQuery, setSearchQuery] = useState('');
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [typingUsers, setTypingUsers] = useState<string[]>([]);
+  const [isServerConnected, setIsServerConnected] = useState(false);
 
   const [language, setLanguage] = useState<'fa' | 'en'>(() => {
     return (localStorage.getItem(`${STORAGE_KEY_PREFIX}lang`) as 'fa' | 'en') || 'fa';
@@ -133,7 +135,168 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     return saved ? JSON.parse(saved) : true;
   });
 
-  // Sync to localStorage
+  // Connect WebSocket to real backend
+  useEffect(() => {
+    socketService.connect(currentUser.id);
+
+    // Initial fetch from backend REST API
+    fetch('/api/conversations')
+      .then(res => res.json())
+      .then(data => {
+        if (data.success && data.conversations?.length > 0) {
+          setConversations(data.conversations);
+        }
+      })
+      .catch(() => {});
+
+    fetch('/api/stories')
+      .then(res => res.json())
+      .then(data => {
+        if (data.success && data.stories?.length > 0) {
+          setStories(data.stories);
+        }
+      })
+      .catch(() => {});
+
+    // Listen to socket events
+    const unsubConn = socketService.on('connection:status', payload => {
+      setIsServerConnected(payload.connected);
+    });
+
+    const unsubMsg = socketService.on('message:new', (msg: Message) => {
+      setAllMessages(prev => {
+        const list = prev[msg.conversationId] || [];
+        // Guard idempotency
+        if (list.some(m => m.id === msg.id)) return prev;
+        return {
+          ...prev,
+          [msg.conversationId]: [...list, msg],
+        };
+      });
+
+      if (msg.senderId !== currentUser.id) {
+        soundEffects.playMessageReceived();
+      }
+
+      setConversations(prev =>
+        prev.map(c =>
+          c.id === msg.conversationId
+            ? {
+                ...c,
+                updatedAt: msg.timestamp,
+                lastMessage: {
+                  id: msg.id,
+                  senderId: msg.senderId,
+                  senderName: msg.senderName,
+                  content: msg.type === 'poll' ? (msg.poll?.question || 'نظرسنجی') : msg.content,
+                  timestamp: msg.timestamp,
+                  type: msg.type,
+                  status: msg.status,
+                },
+              }
+            : c
+        )
+      );
+    });
+
+    const unsubEdit = socketService.on('message:edited', (updated: Message) => {
+      setAllMessages(prev => {
+        const list = prev[updated.conversationId] || [];
+        return {
+          ...prev,
+          [updated.conversationId]: list.map(m => m.id === updated.id ? updated : m),
+        };
+      });
+    });
+
+    const unsubDelete = socketService.on('message:deleted', ({ messageId, conversationId }) => {
+      setAllMessages(prev => {
+        const list = prev[conversationId] || [];
+        return {
+          ...prev,
+          [conversationId]: list.filter(m => m.id !== messageId),
+        };
+      });
+    });
+
+    const unsubReact = socketService.on('message:reacted', ({ messageId, conversationId, reactions }) => {
+      setAllMessages(prev => {
+        const list = prev[conversationId] || [];
+        return {
+          ...prev,
+          [conversationId]: list.map(m => m.id === messageId ? { ...m, reactions } : m),
+        };
+      });
+    });
+
+    const unsubPoll = socketService.on('message:poll_updated', ({ messageId, conversationId, poll }) => {
+      setAllMessages(prev => {
+        const list = prev[conversationId] || [];
+        return {
+          ...prev,
+          [conversationId]: list.map(m => m.id === messageId ? { ...m, poll } : m),
+        };
+      });
+    });
+
+    const unsubTyping = socketService.on('typing:update', ({ conversationId, userName, isTyping }) => {
+      setTypingUsers(prev => {
+        if (isTyping) {
+          return prev.includes(userName) ? prev : [...prev, userName];
+        } else {
+          return prev.filter(u => u !== userName);
+        }
+      });
+    });
+
+    const unsubCallInc = socketService.on('call:incoming', (session: CallSession) => {
+      soundEffects.startRingtone();
+      setCurrentCall(session);
+    });
+
+    const unsubCallAcc = socketService.on('call:accepted', () => {
+      soundEffects.playCallConnected();
+      setCurrentCall(prev => prev ? { ...prev, status: 'connected' } : null);
+    });
+
+    const unsubCallEnd = socketService.on('call:ended', () => {
+      soundEffects.playCallEnded();
+      setCurrentCall(null);
+    });
+
+    return () => {
+      unsubConn();
+      unsubMsg();
+      unsubEdit();
+      unsubDelete();
+      unsubReact();
+      unsubPoll();
+      unsubTyping();
+      unsubCallInc();
+      unsubCallAcc();
+      unsubCallEnd();
+      socketService.disconnect();
+    };
+  }, [currentUser.id]);
+
+  // Load conversation messages from server when active conversation changes
+  useEffect(() => {
+    if (activeConversationId) {
+      fetch(`/api/conversations/${activeConversationId}/messages`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.success && data.messages?.length > 0) {
+            setAllMessages(prev => ({
+              ...prev,
+              [activeConversationId]: data.messages,
+            }));
+          }
+        })
+        .catch(() => {});
+    }
+  }, [activeConversationId]);
+
+  // Sync state to localStorage
   useEffect(() => {
     localStorage.setItem(`${STORAGE_KEY_PREFIX}user`, JSON.stringify(currentUser));
   }, [currentUser]);
@@ -188,7 +351,15 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const messages = activeConversationId ? allMessages[activeConversationId] || [] : [];
 
   const updateUser = (updated: Partial<User>) => {
-    setCurrentUser(prev => ({ ...prev, ...updated }));
+    setCurrentUser(prev => {
+      const next = { ...prev, ...updated };
+      fetch('/api/users/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(next),
+      }).catch(() => {});
+      return next;
+    });
   };
 
   const setDraft = (conversationId: string, text: string) => {
@@ -226,12 +397,12 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     soundEffects.playMessageSent();
 
+    // Optimistic local update
     setAllMessages(prev => ({
       ...prev,
       [convId]: [...(prev[convId] || []), newMsg],
     }));
 
-    // Update conversation last message & timestamp
     setConversations(prev =>
       prev.map(c => {
         if (c.id === convId) {
@@ -253,18 +424,26 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       })
     );
 
+    // Send through WebSocket to real backend
+    socketService.send('message:send', newMsg);
+
+    // Post to REST API for persistent server-side storage
+    fetch(`/api/conversations/${convId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newMsg),
+    }).catch(() => {});
+
     // Clear draft
     setDraft(convId, '');
 
-    // Bot / Echo AI / Contact automated intelligent reply
+    // Bot / Echo AI handling
     const targetConv = conversations.find(c => c.id === convId);
     if (targetConv && (targetConv.type === 'bot' || targetConv.id === 'conv_ai')) {
-      // Simulate typing indicator
       setTypingUsers([targetConv.title]);
       setTimeout(async () => {
         setTypingUsers([]);
         
-        // Request assistant response
         const aiRes = await requestAiAssist({
           action: 'chat',
           text: content,
@@ -294,91 +473,8 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           [convId]: [...(prev[convId] || []), botMsg],
         }));
 
-        setConversations(prev =>
-          prev.map(c =>
-            c.id === convId
-              ? {
-                  ...c,
-                  updatedAt: replyTime,
-                  lastMessage: {
-                    id: botMsg.id,
-                    senderId: 'user_ai',
-                    senderName: targetConv.title,
-                    content: replyContent,
-                    timestamp: replyTime,
-                    type: 'text',
-                    status: 'read',
-                  },
-                }
-              : c
-          )
-        );
+        socketService.send('message:send', botMsg);
       }, 1200);
-    } else if (targetConv && targetConv.type === 'direct' && targetConv.id !== 'conv_saved') {
-      // Periodic natural simulated response if user chats with contacts
-      if (Math.random() > 0.4) {
-        setTimeout(() => {
-          setTypingUsers([targetConv.title]);
-          setTimeout(() => {
-            setTypingUsers([]);
-            const repliesFa = [
-              'عالیه، پیام شما دریافت شد! بررسی می‌کنم.',
-              'ممنون از ارسالت، کاملاً موافقم 👍',
-              'بسیار خوب، اگر نیاز به هماهنگی بیشتر بود تماس می‌گیرم.',
-              'دریافت شد، ممنون از پیگیریت عزیز ✨',
-            ];
-            const repliesEn = [
-              'Awesome, message received! Reviewing now.',
-              'Thanks for sending, totally agree 👍',
-              'Sounds good, let me know if anything else is needed.',
-              'Got it, thanks for the update! ✨',
-            ];
-            const pool = language === 'fa' ? repliesFa : repliesEn;
-            const chosen = pool[Math.floor(Math.random() * pool.length)];
-            const rTime = `${String(new Date().getHours()).padStart(2, '0')}:${String(new Date().getMinutes()).padStart(2, '0')}`;
-
-            const autoMsg: Message = {
-              id: `msg_contact_${Date.now()}`,
-              conversationId: convId,
-              senderId: targetConv.participantIds.find(id => id !== currentUser.id) || 'contact',
-              senderName: targetConv.title,
-              senderAvatar: targetConv.avatar,
-              type: 'text',
-              content: chosen,
-              timestamp: rTime,
-              status: 'delivered',
-              reactions: [],
-            };
-
-            soundEffects.playMessageReceived();
-
-            setAllMessages(prev => ({
-              ...prev,
-              [convId]: [...(prev[convId] || []), autoMsg],
-            }));
-
-            setConversations(prev =>
-              prev.map(c =>
-                c.id === convId
-                  ? {
-                      ...c,
-                      updatedAt: rTime,
-                      lastMessage: {
-                        id: autoMsg.id,
-                        senderId: autoMsg.senderId,
-                        senderName: targetConv.title,
-                        content: chosen,
-                        timestamp: rTime,
-                        type: 'text',
-                        status: 'delivered',
-                      },
-                    }
-                  : c
-              )
-            );
-          }, 1500);
-        }, 1000);
-      }
     }
   };
 
@@ -398,6 +494,12 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         return m;
       }),
     }));
+
+    socketService.send('message:edit', {
+      messageId,
+      conversationId: activeConversationId,
+      newContent,
+    });
   };
 
   const deleteMessage = (messageId: string) => {
@@ -406,10 +508,23 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       ...prev,
       [activeConversationId]: (prev[activeConversationId] || []).filter(m => m.id !== messageId),
     }));
+
+    socketService.send('message:delete', {
+      messageId,
+      conversationId: activeConversationId,
+    });
   };
 
   const addReaction = (messageId: string, emoji: string) => {
     if (!activeConversationId) return;
+    socketService.send('message:react', {
+      messageId,
+      conversationId: activeConversationId,
+      emoji,
+      userId: currentUser.id,
+    });
+
+    // Optimistic update
     setAllMessages(prev => ({
       ...prev,
       [activeConversationId]: (prev[activeConversationId] || []).map(m => {
@@ -418,12 +533,10 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           let updatedReactions = [...m.reactions];
           if (existing) {
             if (existing.userIds.includes(currentUser.id)) {
-              // remove reaction
               updatedReactions = updatedReactions
                 .map(r => r.emoji === emoji ? { ...r, count: r.count - 1, userIds: r.userIds.filter(id => id !== currentUser.id) } : r)
                 .filter(r => r.count > 0);
             } else {
-              // add user
               updatedReactions = updatedReactions.map(r =>
                 r.emoji === emoji ? { ...r, count: r.count + 1, userIds: [...r.userIds, currentUser.id] } : r
               );
@@ -440,54 +553,12 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const votePoll = (messageId: string, optionId: string) => {
     if (!activeConversationId) return;
-    setAllMessages(prev => ({
-      ...prev,
-      [activeConversationId]: (prev[activeConversationId] || []).map(m => {
-        if (m.id === messageId && m.poll) {
-          const poll = m.poll;
-          const userAlreadyVoted = poll.options.some(opt => opt.votedUserIds.includes(currentUser.id));
-          
-          const newOptions = poll.options.map(opt => {
-            if (opt.id === optionId) {
-              const hasVotedThis = opt.votedUserIds.includes(currentUser.id);
-              if (hasVotedThis) {
-                return {
-                  ...opt,
-                  votes: Math.max(0, opt.votes - 1),
-                  votedUserIds: opt.votedUserIds.filter(id => id !== currentUser.id),
-                };
-              } else {
-                return {
-                  ...opt,
-                  votes: opt.votes + 1,
-                  votedUserIds: [...opt.votedUserIds, currentUser.id],
-                };
-              }
-            } else if (!poll.allowsMultiple && userAlreadyVoted) {
-              // Remove vote from previous option if single choice
-              return {
-                ...opt,
-                votes: opt.votedUserIds.includes(currentUser.id) ? Math.max(0, opt.votes - 1) : opt.votes,
-                votedUserIds: opt.votedUserIds.filter(id => id !== currentUser.id),
-              };
-            }
-            return opt;
-          });
-
-          const total = newOptions.reduce((acc, o) => acc + o.votes, 0);
-
-          return {
-            ...m,
-            poll: {
-              ...poll,
-              options: newOptions,
-              totalVotes: total,
-            },
-          };
-        }
-        return m;
-      }),
-    }));
+    socketService.send('message:poll_vote', {
+      messageId,
+      conversationId: activeConversationId,
+      optionId,
+      userId: currentUser.id,
+    });
   };
 
   const pinMessage = (messageId: string) => {
@@ -545,6 +616,7 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       [targetConversationId]: [...(prev[targetConversationId] || []), forwardedMsg],
     }));
 
+    socketService.send('message:send', forwardedMsg);
     soundEffects.playMessageSent();
   };
 
@@ -605,6 +677,13 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     setConversations(prev => [newConv, ...prev]);
     setActiveConversationId(newId);
+
+    fetch('/api/conversations/group', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description, participantIds, creatorId: currentUser.id }),
+    }).catch(() => {});
+
     return newId;
   };
 
@@ -635,6 +714,13 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     setConversations(prev => [newConv, ...prev]);
     setActiveConversationId(newId);
+
+    fetch('/api/conversations/channel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description, username, creatorId: currentUser.id }),
+    }).catch(() => {});
+
     return newId;
   };
 
@@ -653,12 +739,20 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       isViewed: false,
     };
     setStories(prev => [newStory, ...prev]);
+
+    fetch('/api/stories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newStory),
+    }).catch(() => {});
   };
 
   const likeStory = (storyId: string) => {
     setStories(prev =>
       prev.map(s => s.id === storyId ? { ...s, likesCount: s.likesCount + 1 } : s)
     );
+
+    fetch(`/api/stories/${storyId}/like`, { method: 'POST' }).catch(() => {});
   };
 
   const markStoryViewed = (storyId: string) => {
@@ -684,7 +778,9 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     };
     setCurrentCall(session);
 
-    // Auto connect after 2.5 seconds to simulate partner answering!
+    socketService.send('call:initiate', { session, recipientId: targetUser.id });
+
+    // Auto connect after 2.5 seconds to simulate answer if partner is an offline bot/test
     setTimeout(() => {
       soundEffects.playCallConnected();
       setCurrentCall(prev => prev ? { ...prev, status: 'connected', startTime: new Date().toISOString() } : null);
@@ -694,28 +790,34 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const acceptCall = () => {
     soundEffects.playCallConnected();
     setCurrentCall(prev => prev ? { ...prev, status: 'connected', startTime: new Date().toISOString() } : null);
+    if (currentCall) {
+      socketService.send('call:accept', { callerId: currentCall.caller.id, sessionId: currentCall.id });
+    }
   };
 
   const endCall = () => {
     soundEffects.playCallEnded();
-    if (currentCall && activeConversationId) {
-      // Record call log message in chat
-      const logMsg: Message = {
-        id: `call_log_${Date.now()}`,
-        conversationId: activeConversationId,
-        senderId: currentUser.id,
-        type: 'call_log',
-        content: currentCall.type === 'video'
-          ? `تماس تصویری پایان یافت (${Math.floor(currentCall.durationSeconds / 60)}:${String(currentCall.durationSeconds % 60).padStart(2, '0')})`
-          : `تماس صوتی پایان یافت (${Math.floor(currentCall.durationSeconds / 60)}:${String(currentCall.durationSeconds % 60).padStart(2, '0')})`,
-        timestamp: `${new Date().getHours()}:${new Date().getMinutes()}`,
-        status: 'read',
-        reactions: [],
-      };
-      setAllMessages(prev => ({
-        ...prev,
-        [activeConversationId]: [...(prev[activeConversationId] || []), logMsg],
-      }));
+    if (currentCall) {
+      socketService.send('call:end', { targetUserId: currentCall.recipient.id, sessionId: currentCall.id });
+      if (activeConversationId) {
+        const logMsg: Message = {
+          id: `call_log_${Date.now()}`,
+          conversationId: activeConversationId,
+          senderId: currentUser.id,
+          type: 'call_log',
+          content: currentCall.type === 'video'
+            ? `تماس تصویری پایان یافت (${Math.floor(currentCall.durationSeconds / 60)}:${String(currentCall.durationSeconds % 60).padStart(2, '0')})`
+            : `تماس صوتی پایان یافت (${Math.floor(currentCall.durationSeconds / 60)}:${String(currentCall.durationSeconds % 60).padStart(2, '0')})`,
+          timestamp: `${new Date().getHours()}:${new Date().getMinutes()}`,
+          status: 'read',
+          reactions: [],
+        };
+        setAllMessages(prev => ({
+          ...prev,
+          [activeConversationId]: [...(prev[activeConversationId] || []), logMsg],
+        }));
+        socketService.send('message:send', logMsg);
+      }
     }
     setCurrentCall(null);
   };
@@ -782,6 +884,7 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         drafts,
         setDraft,
         typingUsers,
+        isServerConnected,
       }}
     >
       {children}
